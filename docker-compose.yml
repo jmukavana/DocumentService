@@ -49,7 +49,7 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./data:/app/data
+      - docstorage:/app/data
     command: uvicorn app.main:application --host 0.0.0.0 --port 8000
 
   worker:
@@ -70,9 +70,10 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./data:/app/data
+      - docstorage:/app/data
     command: arq app.worker.settings.WorkerSettings
 
 volumes:
   postgres_data:
   redis_data:
+  docstorage:
