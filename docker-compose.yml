@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -9,7 +7,7 @@ services:
       POSTGRES_PASSWORD: docpass
       POSTGRES_DB: docservice
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -52,7 +50,7 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/app/data
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:application --host 0.0.0.0 --port 8000
 
   worker:
     build: .
