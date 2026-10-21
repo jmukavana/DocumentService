@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.document import CompressionAlgo, DocumentStatus
 
@@ -78,6 +78,14 @@ class OcrResponse(BaseModel):
     processed_at: datetime | None = None
 
 
+class DirectOcrResponse(BaseModel):
+    filename: str
+    extracted_text: str
+    language: str
+    confidence: float
+    page_count: int
+
+
 class OcrTriggerResponse(BaseModel):
     document_id: UUID
     status: str  # queued, already_done, already_failed, not_eligible
@@ -89,6 +97,7 @@ class BulkUploadItem(BaseModel):
     status: str  # accepted, skipped_duplicate, failed
     document_id: UUID | None = None
     error: str | None = None
+    document_status: DocumentStatus | None = None
 
 
 class BulkUploadResponse(BaseModel):
@@ -108,6 +117,11 @@ class AuditLogResponse(BaseModel):
     details: dict[str, Any] | None = None
     ip: str | None = None
     created_at: datetime
+
+    @field_validator("ip", mode="before")
+    @classmethod
+    def stringify_ip(cls, value: Any) -> str | None:
+        return str(value) if value is not None else None
 
 
 class AuditLogList(BaseModel):

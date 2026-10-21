@@ -8,16 +8,22 @@ Run the worker with:
 from __future__ import annotations
 
 import io
+import csv
 import logging
 import shutil
 import subprocess
+from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 from PIL import Image
+from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import AsyncSessionLocal
 from app.core.config import settings
+from app.models.audit_log import AuditLog
 from app.models.document import Document, DocumentStatus
 from app.models.ocr_result import OcrResult
 from app.services.compression import decompress
@@ -29,7 +35,7 @@ TESSERACT_CMD = shutil.which("tesseract")
 
 
 def _run_tesseract(image: Image.Image, language: str) -> tuple[str, float]:
-    """Run tesseract on a single PIL image, return (text, avg_confidence)."""
+    """Run Tesseract once and return recognized lines and word confidence."""
     if TESSERACT_CMD is None:
         raise RuntimeError(
             "tesseract binary not found on PATH. Install tesseract-ocr to enable OCR."
@@ -42,7 +48,7 @@ def _run_tesseract(image: Image.Image, language: str) -> tuple[str, float]:
 
     # tesseract reads from stdin (image) and writes text to stdout.
     proc = subprocess.run(  # noqa: PLW1510
-        [TESSERACT_CMD, "stdin", "stdout", "-l", language, "-c", "tessedit_create_hocr=0"],
+        [TESSERACT_CMD, "stdin", "stdout", "-l", language, "tsv"],
         input=buf.read(),
         capture_output=True,
         timeout=120,
@@ -50,21 +56,90 @@ def _run_tesseract(image: Image.Image, language: str) -> tuple[str, float]:
     if proc.returncode != 0:
         raise RuntimeError(f"tesseract failed: {proc.stderr.decode(errors='replace')}")
 
-    text = proc.stdout.decode(errors="replace")
-    # Confidence isn't easily extracted from plain stdout; use a heuristic:
-    # ratio of non-whitespace chars to total as a rough confidence proxy.
-    stripped = text.strip()
-    confidence = min(1.0, len(stripped) / max(len(text), 1)) if text else 0.0
-    return text, confidence
+    lines: list[str] = []
+    words: list[str] = []
+    scores: list[float] = []
+    current_line: tuple[str, str, str, str] | None = None
+    rows = csv.DictReader(io.StringIO(proc.stdout.decode(errors="replace")), delimiter="\t")
+    for row in rows:
+        word = (row.get("text") or "").strip()
+        if not word:
+            continue
+        line = (row["page_num"], row["block_num"], row["par_num"], row["line_num"])
+        if current_line is not None and line != current_line:
+            lines.append(" ".join(words))
+            words = []
+        current_line = line
+        words.append(word)
+        score = float(row.get("conf") or -1)
+        if score >= 0:
+            scores.append(score / 100)
+    if words:
+        lines.append(" ".join(words))
+    return "\n".join(lines), sum(scores) / len(scores) if scores else 0.0
 
 
-async def ocr_task(ctx: dict[str, Any], document_id: str, version_id: str | None = None) -> dict[str, Any]:
+@dataclass(frozen=True)
+class OcrExtraction:
+    text: str
+    confidence: float
+    page_count: int
+
+
+def extract_ocr(data: bytes, mime_type: str, language: str) -> OcrExtraction:
+    """Extract text from PDF pages or a single image."""
+    if mime_type == "application/pdf":
+        page_count = int(pdfinfo_from_bytes(data, timeout=30)["Pages"])
+        if page_count < 1 or page_count > settings.MAX_OCR_PAGES:
+            raise ValueError(f"PDF must have 1-{settings.MAX_OCR_PAGES} pages")
+    else:
+        with Image.open(io.BytesIO(data)) as source:
+            page_count = getattr(source, "n_frames", 1)
+        if page_count < 1 or page_count > settings.MAX_OCR_PAGES:
+            raise ValueError(f"Image must have 1-{settings.MAX_OCR_PAGES} frames")
+
+    all_text: list[str] = []
+    confidences: list[float] = []
+    for page in range(1, page_count + 1):
+        if mime_type == "application/pdf":
+            images = convert_from_bytes(
+                data, dpi=200, first_page=page, last_page=page, thread_count=1, timeout=120,
+            )
+            if not images:
+                raise ValueError(f"Could not render PDF page {page}")
+            image = images[0]
+        else:
+            with Image.open(io.BytesIO(data)) as source:
+                source.seek(page - 1)
+                image = source.convert("RGB")
+        try:
+            text, confidence = _run_tesseract(image, language)
+            all_text.append(text)
+            confidences.append(confidence)
+        finally:
+            image.close()
+
+    return OcrExtraction(
+        text="\n\n--- Page Break ---\n\n".join(all_text),
+        confidence=sum(confidences) / len(confidences) if confidences else 0.0,
+        page_count=page_count,
+    )
+
+
+async def ocr_task(
+    ctx: dict[str, Any], document_id: str, version_id: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
     """OCR a document: decompress, convert PDF pages to images, run tesseract,
     store extracted text, update document status and full-text search vector."""
     async with AsyncSessionLocal() as session:
         doc = await session.get(Document, document_id)
         if doc is None:
             return {"status": "error", "reason": "document_not_found"}
+        if doc.status == DocumentStatus.deleted or (expected_sha256 and doc.sha256 != expected_sha256):
+            return {"status": "skipped", "reason": "stale_or_deleted"}
+        if doc.status == DocumentStatus.ocr_done:
+            return {"status": "ocr_done", "document_id": document_id}
 
         # Mark OCR in progress.
         doc.status = DocumentStatus.ocr_pending
@@ -79,34 +154,32 @@ async def ocr_task(ctx: dict[str, Any], document_id: str, version_id: str | None
 
             payload = decompress(raw, CompressionAlgo(doc.compression_algo))
 
-            # Convert to images.
-            images: list[Image.Image] = []
-            if doc.mime_type == "application/pdf":
-                images = convert_from_bytes(payload, dpi=200)
-            else:
-                # Single image file.
-                images = [Image.open(io.BytesIO(payload)).convert("RGB")]
-
-            all_text: list[str] = []
-            confidences: list[float] = []
-
-            for img in images:
-                text, conf = _run_tesseract(img, settings.OCR_LANGUAGE)
-                all_text.append(text)
-                confidences.append(conf)
-
-            extracted_text = "\n\n--- Page Break ---\n\n".join(all_text)
-            avg_confidence = (
-                sum(confidences) / len(confidences) if confidences else 0.0
-            )
+            extraction = await run_in_threadpool(extract_ocr, payload, doc.mime_type,
+                                                 settings.OCR_LANGUAGE)
+            extracted_text = extraction.text
+            avg_confidence = extraction.confidence
 
             # Build denormalized search text: filename + OCR content.
             search_text = f"{doc.filename}\n\n{extracted_text}".strip()
 
+            # A newer version may have arrived while OCR was running.
+            current = await session.scalar(
+                select(Document).where(Document.id == doc.id).with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if current is None or current.status == DocumentStatus.deleted or (
+                expected_sha256 and current.sha256 != expected_sha256
+            ):
+                await session.rollback()
+                return {"status": "skipped", "reason": "stale_or_deleted"}
+            if current.status == DocumentStatus.ocr_done:
+                await session.rollback()
+                return {"status": "ocr_done", "document_id": document_id}
+
             # Persist OCR result.
             ocr = OcrResult(
                 document_id=doc.id,
-                version_id=version_id,
+                version_id=UUID(version_id) if version_id else None,
                 extracted_text=extracted_text,
                 language=settings.OCR_LANGUAGE,
                 confidence=avg_confidence,
@@ -114,8 +187,12 @@ async def ocr_task(ctx: dict[str, Any], document_id: str, version_id: str | None
             session.add(ocr)
 
             # Update document with OCR text for full-text search.
-            doc.status = DocumentStatus.ocr_done
-            doc.search_text = search_text
+            current.status = DocumentStatus.ocr_done
+            current.search_text = search_text
+            session.add(AuditLog(
+                actor_id="system", action="ocr_complete", document_id=doc.id,
+                details={"version_id": version_id, "characters": len(extracted_text)},
+            ))
             await session.commit()
 
             return {
@@ -127,7 +204,21 @@ async def ocr_task(ctx: dict[str, Any], document_id: str, version_id: str | None
 
         except Exception as exc:
             logger.exception("OCR failed for document %s", document_id)
+            await session.rollback()
+            doc = await session.scalar(
+                select(Document).where(Document.id == document_id).with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if doc is None:
+                return {"status": "error", "reason": "document_not_found"}
+            if doc.status == DocumentStatus.deleted or (expected_sha256 and doc.sha256 != expected_sha256):
+                await session.rollback()
+                return {"status": "skipped", "reason": "stale_or_deleted"}
             doc.status = DocumentStatus.ocr_failed
+            session.add(AuditLog(
+                actor_id="system", action="ocr_failed", document_id=doc.id,
+                details={"version_id": version_id, "error": str(exc)},
+            ))
             await session.commit()
             return {"status": "ocr_failed", "document_id": document_id, "error": str(exc)}
 

@@ -7,6 +7,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # HTTP Basic credentials for document endpoints
+    API_KEY: str | None = Field(default=None)
+    API_SECRET: str | None = Field(default=None)
+
     # Database
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://docuser:docpass@localhost:5432/docservice"
@@ -23,6 +27,11 @@ class Settings(BaseSettings):
 
     # OCR
     OCR_LANGUAGE: str = Field(default="eng")
+    MAX_OCR_PAGES: int = Field(default=50, ge=1)
+    MAX_OCR_BATCH_FILES: int = Field(default=20, ge=1)
+    MAX_MCP_FILE_SIZE_BYTES: int = Field(default=8388608, ge=1024)
+    MCP_ALLOWED_HOSTS: str = Field(default="localhost:*,127.0.0.1:*")
+    MCP_ALLOWED_ORIGINS: str = Field(default="http://localhost:*,http://127.0.0.1:*")
 
     # PDF optimization (pikepdf/qpdf)
     ENABLE_PDF_OPTIMIZE: bool = Field(default=True)

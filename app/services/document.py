@@ -11,9 +11,32 @@ from sqlalchemy.orm import selectinload
 from app.core.security import safe_storage_key
 from app.models.document import CompressionAlgo, Document, DocumentStatus
 from app.models.document_version import DocumentVersion
+from app.models.ocr_result import OcrResult
 from app.schemas.document import DocumentUpdate
 from app.services.compression import compress
+from app.services.extraction import ContentExtraction, extract_content
 from app.services.storage import StorageBackend, get_storage
+
+OCR_MIMES = {
+    "application/pdf", "image/png", "image/jpeg", "image/tiff", "image/bmp",
+    "image/gif", "image/webp",
+}
+def supports_ocr(mime_type: str) -> bool:
+    return mime_type in OCR_MIMES
+
+
+def embedded_extraction(filename: str, mime_type: str, data: bytes) -> ContentExtraction | None:
+    if supports_ocr(mime_type):
+        return None
+    try:
+        return extract_content(data, filename, mime_type, "eng")
+    except Exception:  # noqa: BLE001 - indexing must not prevent storing an arbitrary file
+        return None
+
+
+def searchable_text(filename: str, mime_type: str, data: bytes) -> str:
+    extracted = embedded_extraction(filename, mime_type, data)
+    return f"{filename}\n{extracted.text}" if extracted is not None else filename
 
 
 async def compute_sha256(data: bytes) -> str:
@@ -21,7 +44,10 @@ async def compute_sha256(data: bytes) -> str:
 
 
 async def find_by_sha256(session: AsyncSession, sha256: str) -> Document | None:
-    result = await session.execute(select(Document).where(Document.sha256 == sha256))
+    result = await session.execute(
+        select(Document).where(Document.sha256 == sha256, Document.status != DocumentStatus.deleted)
+        .limit(1)
+    )
     return result.scalar_one_or_none()
 
 
@@ -53,6 +79,8 @@ async def create_document(
     key = safe_storage_key(sha256, filename)
     stored = await storage.save(key, result.data)
 
+    extraction = embedded_extraction(filename, mime_type, data)
+    document_status = (DocumentStatus.ocr_done if extraction is not None else status)
     doc = Document(
         filename=filename,
         stored_path=stored.path,
@@ -65,10 +93,18 @@ async def create_document(
         sha256=sha256,
         owner_id=owner_id,
         department_id=department_id,
-        status=status,
+        status=document_status,
+        search_text=(f"{filename}\n{extraction.text}" if extraction is not None else filename),
     )
     session.add(doc)
     await session.flush()
+    if extraction is not None:
+        session.add(OcrResult(
+            document_id=doc.id,
+            extracted_text=extraction.text,
+            language="eng",
+            confidence=extraction.confidence,
+        ))
     return doc, result.algorithm
 
 
@@ -144,5 +180,19 @@ async def create_version(
     document.compression_ratio = result.compression_ratio
     document.compression_algo = result.algorithm
     document.sha256 = sha256
+    extraction = embedded_extraction(document.filename, mime_type, data)
+    document.search_text = (f"{document.filename}\n{extraction.text}"
+                            if extraction is not None else document.filename)
+    document.status = (DocumentStatus.ocr_done if extraction is not None else
+                       DocumentStatus.ocr_pending if supports_ocr(mime_type) else
+                       DocumentStatus.ready)
+    if extraction is not None:
+        session.add(OcrResult(
+            document_id=document.id,
+            version_id=version.id,
+            extracted_text=extraction.text,
+            language="eng",
+            confidence=extraction.confidence,
+        ))
     await session.flush()
     return version, result.algorithm

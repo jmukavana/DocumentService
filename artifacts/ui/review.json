@@ -1,0 +1,29 @@
+{
+  "contract": "Document operators need a compact console to upload files, run direct OCR, scan the archive, and inspect a document. Upload and search are the first actions. Target viewports are 1440x900 desktop and 390x844 mobile. The repository has no existing frontend; the design uses local CSS and no browser API secrets.",
+  "targetViewports": ["1440x900", "390x844"],
+  "accessibility": {
+    "status": "pass",
+    "evidence": "Forms have associated labels, a skip link is present, and the detail drawer exposes dialog semantics. In headless Chrome, opening a row focused the close button with a visible focus ring; Escape closed the drawer. Reduced-motion CSS disables transitions."
+  },
+  "responsive": {
+    "status": "pass",
+    "evidence": "Desktop and mobile captures show readable controls and document rows. Chrome reported innerWidth, body.scrollWidth, and documentElement.scrollWidth all at 390px in the mobile view, so no horizontal overflow occurred."
+  },
+  "contentStates": {
+    "loading": {"status": "pass", "evidence": "With a delayed list response, the list showed Loading documents and disabled pagination; see loading.png."},
+    "empty": {"status": "pass", "evidence": "A migrated empty database showed No documents yet and an upload next step; see desktop.png."},
+    "error": {"status": "pass", "evidence": "A simulated list failure showed Documents could not load, the failure detail, and Refresh to try again; see error.png."},
+    "partial": {"status": "pass", "evidence": "With only activity retrieval failing, metadata and versions remained available and the drawer said Activity is temporarily unavailable; see partial.png."},
+    "success": {"status": "pass", "evidence": "A disposable sample upload appeared in the list and opened a detail drawer with metadata, download, versions, and activity; see desktop-populated.png and detail.png."},
+    "permission": {"status": "pass", "evidence": "The console returned 401 without credentials and with document API credentials, 200 with separate UI credentials, and 503 when UI login was unconfigured in tests/test_ui.py."}
+  },
+  "renderedEvidence": [
+    {"viewport": "1440x900", "artifact": "desktop.png", "observation": "Empty desktop archive with upload and direct OCR tools beside the library."},
+    {"viewport": "1440x900", "artifact": "desktop-populated.png", "observation": "Populated desktop list with a sample text document and status."},
+    {"viewport": "1440x900", "artifact": "loading.png", "observation": "Loading list state."},
+    {"viewport": "1440x900", "artifact": "error.png", "observation": "Recoverable list error with Refresh action."},
+    {"viewport": "1440x900", "artifact": "partial.png", "observation": "Detail drawer scroll position showing partial activity message."},
+    {"viewport": "390x844", "artifact": "mobile-populated.png", "observation": "Mobile first viewport with upload and OCR tools."},
+    {"viewport": "390x844", "artifact": "mobile-library.png", "observation": "Scrolled mobile archive with search, status filter, and document row."}
+  ]
+}

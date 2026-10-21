@@ -10,6 +10,7 @@ from fastapi import FastAPI
 # Import all models so SQLAlchemy mappers are configured before routes are used.
 from app.api.v1.api import api_router
 from app.core.config import settings
+from app.mcp_http import mcp, streamable_app
 
 
 @asynccontextmanager
@@ -27,7 +28,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "Redis unavailable at startup: %s", exc
         )
     app.state.redis = redis
-    yield
+    async with mcp.session_manager.run():
+        yield
     # Shutdown
     if redis is not None:
         await redis.close()
@@ -35,13 +37,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Document Service",
+        title="PageQuay API",
         description="Enterprise document service with OCR, storage, bulk upload, and compression.",
         version="0.1.0",
         lifespan=lifespan,
     )
 
     app.include_router(api_router, prefix="/api/v1")
+    app.mount("/mcp", streamable_app())
 
     return app
 

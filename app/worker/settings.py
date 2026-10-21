@@ -11,6 +11,6 @@ class WorkerSettings:
         "app.worker.tasks.thumbnail_task",
     ]
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
-    job_timeout = 300
+    job_timeout = settings.MAX_OCR_PAGES * 120 + 60
     max_tries = 3
     keep_result = 3600

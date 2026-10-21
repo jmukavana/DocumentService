@@ -1,7 +1,9 @@
 """Tests for compression service."""
 
+import asyncio
+import gzip
 
-from app.services.compression import CompressionAlgo, compress, decompress
+from app.services.compression import CompressionAlgo, compress, decompress, decompress_chunks
 
 
 def test_compress_text_gzip():
@@ -57,3 +59,31 @@ def test_compress_empty_bytes():
     result = compress(b"", "text/plain", level=6)
     assert result.original_size == 0
     assert result.compressed_size == 0
+
+
+def test_pdf_compression_round_trip():
+    original = b"%PDF-1.4\n" + b"repeated PDF data " * 200
+    result = compress(original, "application/pdf", level=6)
+    assert result.algorithm == CompressionAlgo.gzip
+    assert decompress(result.data, result.algorithm) == original
+
+
+def test_legacy_pdf_compression_round_trip():
+    original = b"%PDF-1.4\nlegacy payload"
+    assert decompress(gzip.compress(original), CompressionAlgo.pdf) == original
+
+
+def test_chunked_pdf_decompression():
+    original = b"%PDF-1.4\n" + b"many pages " * 1000
+    compressed = gzip.compress(original)
+
+    async def chunks():
+        for offset in range(len(compressed)):
+            yield compressed[offset:offset + 1]
+
+    async def restore():
+        return b"".join([chunk async for chunk in decompress_chunks(
+            chunks(), CompressionAlgo.pdf
+        )])
+
+    assert asyncio.run(restore()) == original

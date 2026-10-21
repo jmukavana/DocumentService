@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import io
 import zlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pikepdf
@@ -95,16 +96,15 @@ def compress(
 
     # PDF-specific structural optimization first.
     payload = data
-    algo = CompressionAlgo.gzip
     if _is_pdf(mime_type):
         payload = _optimize_pdf(data, level)
-        algo = CompressionAlgo.pdf
 
     if level >= 9:
         compressed = zlib.compress(payload, level=level)
         algo = CompressionAlgo.zlib
     else:
         compressed = gzip.compress(payload, compresslevel=level)
+        algo = CompressionAlgo.gzip
 
     # Only keep compression if it shrinks the payload.
     if len(compressed) < len(payload):
@@ -130,9 +130,52 @@ def decompress(data: bytes, algorithm: CompressionAlgo) -> bytes:
     if algorithm == CompressionAlgo.zlib:
         return zlib.decompress(data)
     if algorithm == CompressionAlgo.pdf:
-        # PDF optimization output was stored raw (post-optimization).
-        return data
+        # Older uploads marked gzipped PDFs as "pdf"; support both forms.
+        return gzip.decompress(data) if data.startswith(b"\x1f\x8b") else data
     return data
+
+
+async def decompress_chunks(
+    chunks: AsyncIterator[bytes], algorithm: CompressionAlgo
+) -> AsyncIterator[bytes]:
+    """Decompress stored chunks without loading the whole document."""
+    if algorithm == CompressionAlgo.pdf:
+        first = b""
+        while len(first) < 2:
+            chunk = await anext(chunks, b"")
+            if not chunk:
+                break
+            first += chunk
+        if not first.startswith(b"\x1f\x8b"):
+            if first:
+                yield first
+            async for chunk in chunks:
+                yield chunk
+            return
+        algorithm = CompressionAlgo.gzip
+        chunks = _prepend_chunk(first, chunks)
+
+    if algorithm == CompressionAlgo.none:
+        async for chunk in chunks:
+            yield chunk
+        return
+
+    decoder = zlib.decompressobj(
+        16 + zlib.MAX_WBITS if algorithm == CompressionAlgo.gzip else zlib.MAX_WBITS
+    )
+    async for chunk in chunks:
+        if output := decoder.decompress(chunk):
+            yield output
+    if output := decoder.flush():
+        yield output
+    if not decoder.eof:
+        raise ValueError("Truncated compressed document")
+
+
+async def _prepend_chunk(first: bytes, chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    yield first
+    async for chunk in chunks:
+        yield chunk
 
 
 def _compressible(mime_type: str) -> bool:

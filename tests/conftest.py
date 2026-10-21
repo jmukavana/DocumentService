@@ -6,16 +6,27 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import engine, get_db
+from app.core.config import settings
 from app.db.base import Base
 from app.main import create_app
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(autouse=True)
+def test_api_credentials(monkeypatch):
+    monkeypatch.setattr(settings, "API_KEY", "test-key")
+    monkeypatch.setattr(settings, "API_SECRET", "test-secret")
+
+
+@pytest.fixture(scope="session")
 def prepare_database():
     """Clean schema + run Alembic migrations before tests, downgrade after."""
+    database_name = make_url(settings.DATABASE_URL).database or ""
+    if not database_name.endswith("_test"):
+        pytest.fail("DATABASE_URL must target a disposable database ending in _test")
 
     async def _clean():
         async with engine.begin() as conn:

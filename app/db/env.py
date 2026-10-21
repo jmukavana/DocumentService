@@ -13,6 +13,7 @@ from app.db.base import Base
 # Import all models so they are registered on Base.metadata
 from app.models import (
     audit_log,  # noqa: F401
+    customer,  # noqa: F401
     document,  # noqa: F401
     document_version,  # noqa: F401
     ocr_result,  # noqa: F401

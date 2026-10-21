@@ -18,7 +18,8 @@ def _run_with_client(test_fn):
         async with AsyncSessionLocal() as session:
             app = make_app_with_session(session)
             transport = ASGITransport(app=app)
-            ac = AsyncClient(transport=transport, base_url="http://testserver")
+            ac = AsyncClient(transport=transport, base_url="http://testserver",
+                             auth=("test-key", "test-secret"))
             await ac.__aenter__()
             try:
                 await test_fn(ac, session)

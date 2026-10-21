@@ -6,6 +6,7 @@ STORAGE_BACKEND=s3 in the environment.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -32,6 +33,9 @@ class StorageBackend(Protocol):
 
     async def get(self, key: str) -> bytes:
         """Retrieve stored bytes for ``key``."""
+
+    def stream(self, key: str) -> AsyncIterator[bytes]:
+        """Read an object in bounded chunks."""
 
     async def delete(self, key: str) -> None:
         """Remove the object stored at ``key``."""
@@ -66,6 +70,11 @@ class LocalFileStorage(StorageBackend):
 
     async def get(self, key: str) -> bytes:
         return self._full_path(key).read_bytes()
+
+    async def stream(self, key: str) -> AsyncIterator[bytes]:
+        with self._full_path(key).open("rb") as stored:
+            while chunk := stored.read(64 * 1024):
+                yield chunk
 
     async def delete(self, key: str) -> None:
         full = self._full_path(key)
@@ -105,6 +114,15 @@ class S3Storage(StorageBackend):
     async def get(self, key: str) -> bytes:
         obj = self._client.get_object(Bucket=self.bucket, Key=key)
         return obj["Body"].read()  # type: ignore[no-any-return]
+
+    async def stream(self, key: str) -> AsyncIterator[bytes]:
+        body = self._client.get_object(Bucket=self.bucket, Key=key)["Body"]
+        try:
+            for chunk in body.iter_chunks(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            body.close()
 
     async def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self.bucket, Key=key)

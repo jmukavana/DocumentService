@@ -35,6 +35,8 @@ services:
     ports:
       - "8000:8000"
     environment:
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      API_SECRET: ${API_SECRET:?Set API_SECRET in .env}
       DATABASE_URL: postgresql+asyncpg://docuser:docpass@postgres:5432/docservice
       REDIS_URL: redis://redis:6379/0
       STORAGE_BACKEND: local
@@ -50,7 +52,7 @@ services:
         condition: service_healthy
     volumes:
       - docstorage:/app/data
-    command: uvicorn app.main:application --host 0.0.0.0 --port 8000
+    command: sh -c "alembic upgrade head && exec uvicorn app.main:application --host 0.0.0.0 --port 8000"
 
   worker:
     build: .
@@ -72,6 +74,21 @@ services:
     volumes:
       - docstorage:/app/data
     command: arq app.worker.settings.WorkerSettings
+
+  web:
+    build: ./web
+    container_name: docservice_web
+    ports:
+      - "3000:3000"
+    environment:
+      DOCUMENT_API_URL: http://app:8000
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      API_SECRET: ${API_SECRET:?Set API_SECRET in .env}
+      UI_USERNAME: ${UI_USERNAME:?Set UI_USERNAME in .env}
+      UI_PASSWORD: ${UI_PASSWORD:?Set UI_PASSWORD in .env}
+      UI_SESSION_SECRET: ${UI_SESSION_SECRET:-}
+    depends_on:
+      - app
 
 volumes:
   postgres_data:

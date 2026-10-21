@@ -18,7 +18,8 @@ def _run_with_client(test_fn):
         async with AsyncSessionLocal() as session:
             app = make_app_with_session(session)
             transport = ASGITransport(app=app)
-            ac = AsyncClient(transport=transport, base_url="http://testserver")
+            ac = AsyncClient(transport=transport, base_url="http://testserver",
+                             auth=("test-key", "test-secret"))
             await ac.__aenter__()
             try:
                 await test_fn(ac)
@@ -42,7 +43,7 @@ def test_upload_document(prepare_database):
         assert data["filename"] == "hello.txt"
         assert data["mime_type"] == "text/plain"
         assert data["size_bytes"] == 11
-        assert data["status"] == "ocr_pending"
+        assert data["status"] == "ready"
         assert "id" in data
         assert "sha256" in data
 
@@ -263,5 +264,101 @@ def test_unsupported_media_type(prepare_database):
         files = {"file": ("script.sh", io.BytesIO(b"echo hi"), "application/x-shellscript")}
         resp = await ac.post("/api/v1/documents/upload", files=files)
         assert resp.status_code == 415, resp.text
+
+    _run_with_client(test)
+
+
+def test_pdf_download_round_trip_and_audit(prepare_database):
+    """Compressed PDF downloads retain their bytes and write audit entries."""
+    async def test(ac):
+        original = b"%PDF-1.4\n" + b"repeated payload " * 200
+        upload = await ac.post(
+            "/api/v1/documents/upload",
+            files={"file": ("sample.pdf", io.BytesIO(original), "application/pdf")},
+        )
+        assert upload.status_code == 201, upload.text
+        doc_id = upload.json()["id"]
+        download = await ac.get(f"/api/v1/documents/{doc_id}/download")
+        assert download.status_code == 200
+        assert download.content == original
+        assert "content-encoding" not in download.headers
+        assert "filename*=UTF-8''sample.pdf" in download.headers["content-disposition"]
+
+        audit = await ac.get(f"/api/v1/documents/admin/audit-logs?document_id={doc_id}")
+        assert audit.status_code == 200, audit.text
+        assert {item["action"] for item in audit.json()["items"]} == {"upload", "download"}
+        assert all(item["actor_id"] == "test-key" for item in audit.json()["items"])
+
+    _run_with_client(test)
+
+
+def test_image_ocr_worker_writes_audit(prepare_database, monkeypatch):
+    """An OCR completion records extracted text and a system audit event."""
+    from PIL import Image
+
+    from app.worker import tasks
+
+    monkeypatch.setattr(tasks, "_run_tesseract", lambda image, language: ("sample text", 0.9))
+    image = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image, format="PNG")
+
+    async def test(ac):
+        upload = await ac.post(
+            "/api/v1/documents/upload",
+            files={"file": ("scan.png", io.BytesIO(image.getvalue()), "image/png")},
+        )
+        assert upload.status_code == 201, upload.text
+        doc_id = upload.json()["id"]
+        result = await tasks.ocr_task({}, doc_id)
+        assert result["status"] == "ocr_done"
+        assert result["characters"] == len("sample text")
+
+        audit = await ac.get(f"/api/v1/documents/admin/audit-logs?document_id={doc_id}")
+        events = {(item["action"], item["actor_id"]) for item in audit.json()["items"]}
+        assert ("ocr_complete", "system") in events
+
+    _run_with_client(test)
+
+
+def test_direct_ocr_upload_returns_text_without_document(prepare_database, monkeypatch):
+    """Direct OCR returns text without creating a stored document."""
+    from PIL import Image
+
+    from app.worker import tasks
+
+    monkeypatch.setattr(tasks, "_run_tesseract", lambda image, language: ("invoice 123", 0.85))
+    image = io.BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(image, format="PNG")
+
+    async def test(ac):
+        response = await ac.post(
+            "/api/v1/documents/ocr/upload",
+            files={"file": ("invoice.png", io.BytesIO(image.getvalue()), "image/png")},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "filename": "invoice.png",
+            "extracted_text": "invoice 123",
+            "language": "eng",
+            "confidence": 0.85,
+            "page_count": 1,
+        }
+
+        documents = await ac.get("/api/v1/documents/")
+        assert documents.json()["total"] == 0
+        audit = await ac.get("/api/v1/documents/admin/audit-logs?action=ocr_direct")
+        assert audit.json()["total"] == 1
+        assert audit.json()["items"][0]["document_id"] is None
+
+    _run_with_client(test)
+
+
+def test_direct_ocr_rejects_non_image(prepare_database):
+    async def test(ac):
+        response = await ac.post(
+            "/api/v1/documents/ocr/upload",
+            files={"file": ("notes.txt", io.BytesIO(b"hello"), "text/plain")},
+        )
+        assert response.status_code == 415
 
     _run_with_client(test)
